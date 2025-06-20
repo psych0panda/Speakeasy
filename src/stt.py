@@ -19,16 +19,25 @@
     asyncio.run(main())
 """
 
+# pyright: reportGeneralTypeIssues=false
+# pyright: reportMissingImports=false
+
 from __future__ import annotations
 
 import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, List, Optional, Any
 
 import numpy as np
-from faster_whisper import WhisperModel, Segment
+
+try:
+    from faster_whisper import WhisperModel, Segment  # type: ignore
+except ImportError:  # pragma: no cover
+    # Fallback stubs for static type checkers when faster_whisper not installed.
+    WhisperModel = object  # type: ignore[assignment]
+    Segment = object  # type: ignore[assignment]
 
 __all__ = [
     "TranscribedSegment",
@@ -125,12 +134,16 @@ class WhisperStreamer:
             raise ValueError("chunk/step must be > 0")
 
         i = 0
+        unchanged_steps = 0  # счётчик, чтобы понять, когда гипотеза стабилизировалась
+        last_text: str = ""
+
         while i < len(audio):
             window = audio[i : i + chunk]
             if len(window) < chunk:
                 # Zero-pad the last chunk
                 window = np.pad(window, (0, chunk - len(window)))
 
+            # faster-whisper streaming iterator даёт накопительный вывод за окно
             segments: List[Segment] = list(
                 self._model.transcribe_iterator(
                     window,
@@ -142,15 +155,38 @@ class WhisperStreamer:
                 )
             )
 
-            # Convert segments
-            for seg in segments:
-                start = self._prev_offset + seg.start
-                end = self._prev_offset + seg.end
-                yield TranscribedSegment(seg.text, start, end, is_final=True)
+            concat_text = " ".join(seg.text.strip() for seg in segments).strip()
+
+            if concat_text and concat_text != last_text:
+                # Текст изменился → отправляем промежуточный сегмент
+                unchanged_steps = 0
+                # Время сегмента – от начала окна до текущего конца
+                start_ts = self._prev_offset
+                end_ts = self._prev_offset + len(window) / samplerate
+                yield TranscribedSegment(concat_text, start_ts, end_ts, is_final=False)
+                last_text = concat_text
+            else:
+                unchanged_steps += 1
+
+            # если текст не менялся N шагов подряд — считаем его финальным
+            if unchanged_steps >= 3 and last_text:
+                end_ts = self._prev_offset + len(window) / samplerate
+                yield TranscribedSegment(
+                    last_text, self._prev_offset, end_ts, is_final=True
+                )
+                last_text = ""
+                unchanged_steps = 0
 
             await asyncio.sleep(0)  # let event loop breathe
             i += step
             self._prev_offset += step / samplerate
+
+        # обработка хвоста
+        if last_text:
+            end_ts = self._prev_offset
+            yield TranscribedSegment(
+                last_text, self._prev_offset - chunk / samplerate, end_ts, is_final=True
+            )
 
     # ------------------------------------------------------------------
     # Simple blocking helper
@@ -158,5 +194,5 @@ class WhisperStreamer:
 
     def transcribe(self, audio: np.ndarray, samplerate: int) -> str:
         """Синхронно распознаёт полный буфер и возвращает текст."""
-        result = self._model.transcribe(audio, language="en")
+        result = self._model.transcribe(audio, language="en")  # type: ignore[attr-defined]
         return " ".join(seg.text for seg in result[0])
